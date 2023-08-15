@@ -1,150 +1,104 @@
-# Что это?
+# What?
 
-torxy - прозрачный HTTP/HTTPS-прокси, позволяющий перенаправлять трафик
-на выбранные домены через TOR-сервер.
+`torxy` - A transparent HTTP/HTTPS-proxy which redirect requests to some domains to the TOR local SOCKS5 server.
 
-# Идея
+# Why?
 
-Посылами к созданию проекта послужили три причины: блокировки некоторых
-сайтов, вызванные этим неудобства и полное отсутствие готовых решений.
-Разумеется, всегда можно завернуть вообще весь трафик в VPN, однако это
-имеет свои очевидные неудобства. Городить же ужасающие дикие костыли в
-виде резолвинга доменов в IP для их последующей хитрой маршрутизации это
-тоже такое себе решение. Хотелось иметь просто прозрачный HTTP/HTTPS-прокси,
-который можно установить на роутер и заворачивать в TOR не все сайты,
-а только необходимые.
+The typical solution is based on DNS server and marking packets going through the router. When a browser goes
+to domain `example.com` a DNS server resolves its IPs, append them into ipset/iptable or set/nftables and put
+some mark `42` on this conntrack. Than this conntrack can be redirected to a VPN or some proxy server.
 
-Какие были пожелания, что прокси должен уметь:
+At the first look this solution looks stable and solid-rock. But there is a problem - a domain can be hosted
+on a server which also contains some other sites. And they can be unavailable when accessing through a VPN or proxy.
 
-- Работать в прозрачном режиме;
-- Извлекать из запросов название домена и на основании заданных правил либо
-  проксировать запрос "как есть", либо оборачивать в SOCKS и перенаправлять в
-  TOR-сервер;
-- Поддерживать [Server Name Indication](https://ru.wikipedia.org/wiki/Server_Name_Indication),
-  чтобы обрабатывать не только HTTP/1.1, но также и TLS;
+Is there a better solution? We can intercept requests from a browser in order to inspect on which domain they go.
+And after that make a decision what to do next. In case of HTTPS we need to get a
+[Server Name Indication](https://ru.wikipedia.org/wiki/Server_Name_Indication) from a request and parse it.
 
-Проведённые изыскания готовых решений показали полное отсутствие таковых.
-Наиболее подходящим на первый взгляд показался проект [python-proxy](https://github.com/qwj/python-proxy).
-Однако он не умеет работать в прозрачном режиме и вообще не поддерживает SNI.
-Идея его допатчить до состояния стояния быстро пропала после изучения исходников,
-в которых скрупулёзно реализована абстрактная фабрика виртуальных метаклассов c
-шаблонными методами.
+# Router setup
 
-В итоге стало ясно, что придётся засучить рукава и взяться за дело самому.
+1. Add IP `169.254.254.254/32` to the loopback interface:
 
-# Область применения
+   `ip addr add 169.254.254.254/32 dev lo`
 
-Проект предназначен для сугубо личного использования в небольшой (домашней)
-локальной сети. На серьёзную нагрузку не рассчитывался и вообще написан "на
-скорую руку" за один день как "pet-project". Однако, это не значит, что он
-не работает или работает плохо. Просто применять его следует по назначению.
+   It is necessary because a packet can not be NATed to `127.0.0.0/8` network. Linux kernel drops such packets
+   as [martian](https://en.wikipedia.org/wiki/Martian_packet). But instead they can be NATed to `169.254.0.0/16`.
 
-# Как работает
+1. Add a DNAT rule to the firewall:
 
-torxy принимает запросы, извлекает из них название домена и в зависимости
-от заданных правил либо пропускает запрос "как есть", без изменений, либо
-направляет в SOCKS5-сервер, встроенный в TOR-сервер. Запросы, которые не
-были распознаны как HTTP или HTTPS, будут пропущены "как есть".
+   iptables:
 
-# Недостатки
+   ```
+   iptables \
+       -A PREROUTING \
+       -s $LAN \
+       -p tcp -m multiport --dports http,https \
+       -j DNAT --to-destination 169.254.254.254:3128
+   ```
 
-- Нет поддержки авторизации в SOCKS. Просто потому, что сам прокси и TOR-сервер
-  работают на одном хосте и делать ещё и авторизацию было бы излишне параноидально;
-- Поддерживаются только TLS-подключения, в которых есть SNI. TLS-подключения без SNI
-  будут обрабатываться "как есть", поскольку название хоста при этом неизвестно;
+   nftables:
 
-# Настройка на роутере
+   ```
+   nft add table ip nat
+   nft add chain ip nat PREROUTING { type nat hook prerouting priority dstnat; }
+   nft add rule ip nat PREROUTING ip saddr "$LAN" tcp dport { 80,443 } counter dnat to 169.254.254.254:3128
+   ```
 
-Первым делом требуется добавить на интерфейс `lo` адрес `169.254.254.254/32`.
-Это необходимо потому, что нельзя просто взять и сделать DNAT на адрес из сети
-127.0.0.0/8. Потому как при настройках по-умолчанию ядро воспринимает такие пакеты
-как [martian](https://en.wikipedia.org/wiki/Martian_packet). Это можно отключить,
-но лучше не надо.
+   `$LAN` - local network address, for instance `10.193.68.0/24`. `3128` is a port which `torxy` is listening on.
 
-Добавляем адрес:
+1. If you want to browse `.onion` sites you need to override their addresses to the router address.
+   In case of using `dnsmasq` the configuration line looks like this:
 
-`ip addr add 169.254.254.254/32 dev lo`
+   `address=/onion/$ROUTER`
 
-Далее, для прозрачного проксирования нужно добавить правило DNAT:
+   Where `$ROUTER` is the local address of your router, for instance `10.193.68.1`.
+
+# Rules
+
+Rules stored in `/etc/torxy.rules`.
+
+- Empty lines and lines starting with `#` are ignored.
+- Each line should contains the only one rule.
+- First matching rule wins.
+- Rule is case insensitive.
+- URL can not be used in rule.
+
+Examples:
 
 ```
-iptables \
-    -A PREROUTING \
-    -s $LAN \
-    -p tcp -m multiport --dports http,https \
-    -j DNAT --to-destination 169.254.254.254:3128
-```
-
-Где `$LAN` - адрес локальной сети, например `10.193.68.0/24`.
-
-Настройки TOR-сервера выходят за рамки данного мануала, лучше будет обратиться
-к официальной документации. Для работы прокси нужно чтобы TOR-сервер принимал
-подключения по протоколу SOCKS5 без авторизации на порту 9050 (или любом другом).
-
-Вариантов настройки DNS для зоны `.onion` много, один из них таков. В конфиге
-`dnsmasq.conf` добавляем запись:
-
-`address=/onion/$ROUTER`
-
-Где `$ROUTER` - локальный адрес роутера. Тогда любой домен в зоне `.onion` будет
-указывать на роутер, что в итоге приведёт к попаданию запроса в прокси, который
-с этим уже разберётся.
-
-# Правила перенаправления
-
-Запрос, подпадающий под правило, будет направлен в SOCKS-сервер, предоставляемый
-сервером TOR.
-
-**Важно!** Поиск по списку правил выполняется за O(n). То есть, не стоит добавлять
-туда слишком много правил, иначе запросы начнут дичайше тормозить.
-
-Конфиг с правилами по-умолчанию находится в файле `/etc/torxy.rules`. По одному
-правилу на строку. Строки, начинающиеся с символа `#` считаются комментариями.
-Сравнение производится до первого совпадения. Сравнение выполняется методом
-вхождения подстроки в строку. Регулярные выражения не поддерживаются. Под сравнение
-подпадают только имена хостов (заголовок `Host:` в HTTP или SNI в TLS), URL не
-поддерживаются.
-
-Примеры правил:
-
-```
-# Вся зона .onion.
+# Whole zone .onion.
 .onion
 
-# Один отдельный сайт.
+# The only one site.
 homedepot.com
 ```
 
-Сравнение по методу вхождения подстроки в строку подразумевает, что заданное правило
-ищется как подстрока в имени хоста в запросе. То есть:
+"Match" means "contains", i.e.:
 
-Правило: `example.com`
-Хост: `example.com` => Правило сработало.
-Хост: `www.example.com` => Правило сработало.
-Хост: `example.com.net` => Правило сработало.
-Хост: `example.org` => Правило НЕ сработало.
+Rule: `example.com`
 
-Метод имеет свои недостатки, например правило сработает на хост `notexample.com`.
-Однако, является достаточно разумным компромиссом между гибкостью и удобством.
-Регулярные выражения были бы ещё более гибкими, но менее удобными, а wildcards
-(`*.`) потребовали бы создавать несколько записей для одного хоста (с `www` и
-без `www`).
+Domain: `example.com` => Matches.
 
-# Системные требования
+Domain: `example.com.net` => Matches.
+
+Domain: `example.org` => Not matches.
+
+# Requirements
 
 - Python >= 3.7;
 - [dpkt](https://github.com/kbandla/dpkt)
-- [systemd](https://github.com/systemd/python-systemd) (опционально);
+- [systemd](https://github.com/systemd/python-systemd) (optionally);
 
-# Установка
+# Performance
 
-[Пример пакетирования](https://github.com/vimusov/custom-repo) под archlinux.
+`torxy` is not intended to be as fast as possible. But on my router with Celeron J3160 and 8 Gb of RAM it handles
+100 Mbit/s easily.
 
-# Запуск и управление
+# Usage
 
-См. `torxy --help`.
-Поддерживается перезагрузка правил без остановки, по сигналу `SIGHUP`.
+See `torxy --help` for details.
+Rules can be reloaded on `SIGHUP`.
 
-# Лицензия
+# License
 
 GPL.
